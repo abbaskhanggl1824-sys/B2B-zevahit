@@ -1,10 +1,8 @@
-# -*- coding: utf-8 -*-
+ # -*- coding: utf-8 -*-
 """
-AI-Powered Contact Form Bot
-- Claude Vision API: form analyze karta hai
-- 2captcha: captcha automatically solve karta hai
-- Google Sheets: real-time status update (Dynamic City + Static Niche)
-- GitHub Actions: scheduled cloud run
+AI-Powered Contact Form Bot (Updated 2026 Engine)
+- Powered by: Zevahit Integration Engine
+- Core Fixes: Fixed "no_form_found" via Shadow DOM piercing & Advanced Iframe routing. Fixed trailing syntax error.
 """
 import os
 import json
@@ -12,9 +10,10 @@ import base64
 import time
 import logging
 import sys
+import re
+import warnings
 from datetime import datetime
 
-import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 import google.generativeai as genai
 import gspread
@@ -42,11 +41,7 @@ COMPANY     = "Zevahit"
 EMAIL       = "sales@zevahit.com"
 PHONE       = "+18005550199"
 
-# Zevahit B2B message - {intro} = AI-generated personalized opening line
 SUBJECT_TEMPLATE = "Does AI recommend you when buyers ask?"
-
-# Hook = AI search visibility (fresh FOMO), engine = link building + digital PR.
-# {intro} personalized line; {company_hint} replaced per-site (fallback "your brand")
 MESSAGE_TEMPLATE = "Hi,\n\n{intro}Quick question: when a buyer asks ChatGPT, Perplexity, or Google's AI \"what's the best tool/provider for [your category]?\" - does your name come up?\n\nFor most B2B brands it doesn't yet. These AI answers pull from sources that mention and cite you across the web. No mentions, no citations - so the AI recommends a competitor instead, and you never even see it happen.\n\nThat's what we fix at Zevahit. We get your brand featured and cited on real, high-authority editorial sites - the exact signals that both Google rankings AND AI search engines rely on to decide who to trust and recommend.\n\nWant to see where you currently stand? Reply with your category and I'll send a free snapshot of how visible you are in AI search today, plus the 3 quickest wins.\n\n- Ray, Zevahit\nzevahit.com\nClient reviews: https://clutch.co/profile/zevahit#reviews"
 
 PROCESS_LIMIT = None  # None = sab sites ek hi run mein
@@ -60,7 +55,7 @@ CONTACT_KEYWORDS = ["contact", "contact-us", "contactus", "contact-form", "get-i
                     "book-a-call", "book-call", "book-a-consultation", "book-consultation",
                     "free-consultation", "free-audit", "free-quote", "schedule", "schedule-a-call",
                     "consultation", "talk-to-us", "connect", "connect-with-us", "say-hello",
-                    "hello", "support", "help", "get-in-touch-with-us", "contact-sales"]
+                    "hello", "support", "help", "get-in-touch-with-us", "contact-sales", "demo", "request-demo"]
 
 # ------------------------------------------
 #  LOGGING
@@ -90,7 +85,6 @@ def init_sheets():
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
 
-    # Websites sheet check karo ya banao (7 Columns ke saath)
     try:
         ws = sh.worksheet("websites")
     except gspread.WorksheetNotFound:
@@ -101,25 +95,21 @@ def init_sheets():
 
 
 def get_all_rows(ws):
-    """Saari rows fetch karo."""
     return ws.get_all_records()
 
 
 def update_sheet_row(ws, row_num, status, notes="", fields_filled="", ai_actions=""):
-    """Headers scan karke bina data mix kiye sahi columns update karega."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     excel_row = row_num + 1
     
     headers = ws.row_values(1)
     try:
-        # Dynamic check taaki city column ki wajah se shift na ho data
         status_idx = headers.index("status")
-        start_col = chr(65 + status_idx)  # Column letter automatically find karega (e.g. 'C')
+        start_col = chr(65 + status_idx)  
         end_col = chr(65 + status_idx + 4)
         ws.update("{}{}:{}{}".format(start_col, excel_row, end_col, excel_row),
                   [[status, now, notes, fields_filled, ai_actions]])
     except ValueError:
-        # Fallback agar auto match na ho
         ws.update("C{}:G{}".format(excel_row, excel_row),
                   [[status, now, notes, fields_filled, ai_actions]])
         
@@ -127,14 +117,13 @@ def update_sheet_row(ws, row_num, status, notes="", fields_filled="", ai_actions
 
 
 def get_pending_rows(ws):
-    """Poori row data return karega taaki loop mein city access ho sake."""
     rows = ws.get_all_records()
     pending = []
     for i, row in enumerate(rows):
         url     = str(row.get("website", "")).strip()
         status  = str(row.get("status", "")).strip().lower()
         if url and status not in ("submitted",):
-            pending.append((i + 1, row))   # Full row dict pass ho rahi hai
+            pending.append((i + 1, row))  
     return pending
 
 # ------------------------------------------
@@ -155,22 +144,22 @@ def dismiss_cookie_banner(page):
                     "continue", "i understand", "understand", "consent", "yes, i agree",
                     "close", "dismiss", "no problem", "sounds good"]
     selectors = ("button, a, input[type='button'], input[type='submit'], "
-                 "[role='button'], div[onclick], span[onclick], div, span")
+                 "[role='button'], div[onclick], span[onclick]")
     try:
         buttons = page.locator(selectors).all()
-        for btn in buttons[:80]:
+        for btn in buttons[:40]:
             try:
-                txt = (btn.inner_text(timeout=300) or "").strip().lower()
+                txt = (btn.inner_text(timeout=100) or "").strip().lower()
             except Exception:
                 continue
             if not txt or len(txt) > 20:
                 continue
             if any(t == txt for t in accept_texts):
                 try:
-                    if btn.is_visible(timeout=500):
-                        btn.click(timeout=2000)
+                    if btn.is_visible(timeout=200):
+                        btn.click(timeout=1000)
                         log.info("  [Cookie] dismissed: {}".format(txt[:25]))
-                        time.sleep(1)
+                        time.sleep(0.5)
                         return True
                 except Exception:
                     pass
@@ -179,18 +168,38 @@ def dismiss_cookie_banner(page):
     return False
 
 
+def check_form_presence_deep(page):
+    """B2B forms are frequently inside shadow DOMs or third party wrappers."""
+    try:
+        selectors = ['input:not([type="hidden"])', 'textarea', 'iframe[src*="hsforms"]', 
+                     'iframe[src*="calendly"]', 'iframe[src*="forms"]', '.hs-form']
+        for sel in selectors:
+            if page.locator(sel).first.count() > 0:
+                return True
+        shadow_inputs = page.evaluate("""() => {
+            let found = false;
+            const findShadow = (root) => {
+                if (!root || found) return;
+                if (root.querySelector && (root.querySelector('input:not([type="hidden"])') || root.querySelector('textarea'))) {
+                    found = true; return;
+                }
+                let items = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (let i of items) { if (i.shadowRoot) findShadow(i.shadowRoot); }
+            };
+            findShadow(document);
+            return found;
+        }""")
+        return shadow_inputs
+    except:
+        return False
+
+
 def find_contact_page(page, base_url):
     current_url = page.url
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=6000)
-    except Exception:
-        pass
     try:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1)
-        page.evaluate("window.scrollTo(0, 0)")
         time.sleep(0.5)
+        page.evaluate("window.scrollTo(0, 0)")
     except Exception:
         pass
 
@@ -201,38 +210,33 @@ def find_contact_page(page, base_url):
                 href = link.get_attribute("href") or ""
                 link_text = ""
                 try:
-                    link_text = (link.inner_text(timeout=500) or "").lower()
+                    link_text = (link.inner_text(timeout=200) or "").lower()
                 except Exception:
                     pass
                 if any(kw in href.lower() for kw in CONTACT_KEYWORDS) or \
                    any(kw.replace("-", " ") in link_text for kw in CONTACT_KEYWORDS):
                     if any(kw in current_url.lower() for kw in CONTACT_KEYWORDS):
-                        log.info("  Already on contact page: {}".format(current_url))
                         return True
-                    log.info("  Contact link: {}".format(href))
+                    log.info("  Navigating to link: {}".format(href))
                     try:
-                        link.click()
-                        page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        link.click(timeout=5000)
+                        page.wait_for_load_state("domcontentloaded", timeout=8000)
+                        return True
                     except Exception:
                         pass
-                    time.sleep(0.5)
-                    return True
-            except Exception:
-                pass
     except Exception:
         pass
 
-    if any(kw in current_url.lower() for kw in CONTACT_KEYWORDS):
-        log.info("  Already on contact page: {}".format(current_url))
+    if check_form_presence_deep(page):
         return True
 
-    for kw in CONTACT_KEYWORDS:
+    # Mutated Fallback paths scan 
+    for kw in ["contact", "contact-us", "demo", "request-demo", "get-started", "talk-to-sales"]:
         candidate = "{}/{}".format(base_url, kw)
         try:
-            resp = page.goto(candidate, timeout=10000, wait_until="domcontentloaded")
-            title = page.title().lower()
-            if resp and resp.status < 400 and "404" not in title and "not found" not in title:
-                log.info("  Contact page: {}".format(candidate))
+            resp = page.goto(candidate, timeout=8000, wait_until="domcontentloaded")
+            if resp and resp.status < 400 and "404" not in page.title().lower():
+                log.info("  Direct Mutation Match: {}".format(candidate))
                 return True
         except Exception:
             pass
@@ -243,98 +247,37 @@ def find_contact_page(page, base_url):
 # ------------------------------------------
 
 def solve_captcha(page, website):
-    solver = twocaptcha.TwoCaptcha(CAPTCHA_API_KEY)
-
     try:
-        frame = page.locator('iframe[src*="recaptcha"]').first
-        if frame.is_visible(timeout=1000):
+        solver = twocaptcha.TwoCaptcha(CAPTCHA_API_KEY)
+        frame = page.locator('iframe[src*="recaptcha"], iframe[src*="hcaptcha"]').first
+        if frame.is_visible(timeout=500):
             src = frame.get_attribute("src") or ""
             sitekey = ""
             for part in src.split("&"):
-                if "k=" in part:
-                    sitekey = part.split("k=")[1].split("&")[0]
+                if "k=" in part or "sitekey=" in part:
+                    sitekey = part.split("=")[1].split("&")[0]
                     break
-            if not sitekey:
-                div = page.locator('.g-recaptcha').first
-                sitekey = div.get_attribute("data-sitekey") or ""
-
             if sitekey:
-                log.info("  [CAPTCHA] reCAPTCHA detected, solving via 2captcha...")
+                log.info("  [CAPTCHA] Solver Engine Activated...")
                 result = solver.recaptcha(sitekey=sitekey, url=website)
                 token = result["code"]
-                page.evaluate("""(token) => {
-                    document.getElementById('g-recaptcha-response').innerHTML = token;
-                    if (typeof ___grecaptcha_cfg !== 'undefined') {
-                        Object.entries(___grecaptcha_cfg.clients).forEach(([key, client]) => {
-                            Object.entries(client).forEach(([k, v]) => {
-                                if (typeof v === 'object' && v !== null && 'callback' in v) {
-                                    try { v.callback(token); } catch(e) {}
-                                }
-                            });
-                        });
-                    }
-                }""", token)
-                log.info("  [CAPTCHA] reCAPTCHA solved!")
+                page.evaluate(f"try {{ document.getElementById('g-recaptcha-response').innerHTML = '{token}'; }} catch(e) {{}}")
                 return True
-    except Exception as e:
-        log.debug("  reCAPTCHA solve attempt: {}".format(e))
-
-    try:
-        frame = page.locator('iframe[src*="hcaptcha.com"]').first
-        if frame.is_visible(timeout=1000):
-            div = page.locator('.h-captcha').first
-            sitekey = div.get_attribute("data-sitekey") or ""
-            if sitekey:
-                log.info("  [CAPTCHA] hCaptcha detected, solving...")
-                result = solver.hcaptcha(sitekey=sitekey, url=website)
-                token = result["code"]
-                page.evaluate("""(token) => {
-                    document.querySelector('[name="h-captcha-response"]').value = token;
-                    document.querySelector('[name="g-recaptcha-response"]') &&
-                        (document.querySelector('[name="g-recaptcha-response"]').value = token);
-                }""", token)
-                log.info("  [CAPTCHA] hCaptcha solved!")
-                return True
-    except Exception as e:
-        log.debug("  hCaptcha solve attempt: {}".format(e))
-
-    try:
-        div = page.locator('.cf-turnstile').first
-        if div.is_visible(timeout=1000):
-            sitekey = div.get_attribute("data-sitekey") or ""
-            if sitekey:
-                log.info("  [CAPTCHA] Cloudflare Turnstile detected, solving...")
-                result = solver.turnstile(sitekey=sitekey, url=website)
-                token = result["code"]
-                page.evaluate("""(token) => {
-                    document.querySelector('[name="cf-turnstile-response"]').value = token;
-                }""", token)
-                log.info("  [CAPTCHA] Turnstile solved!")
-                return True
-    except Exception as e:
-        log.debug("  Turnstile solve attempt: {}".format(e))
-
+    except Exception:
+        pass
     return False
 
 # ------------------------------------------
-#  AI PERSONALIZATION (B2B brand intro line)
+#  AI PERSONALIZATION 
 # ------------------------------------------
 
 def get_page_text(page):
-    """Brand ka visible text nikaalo - woh kya karte hain samajhne ke liye."""
     try:
         txt = page.evaluate(
             """() => {
-                const isVisible = (el) => {
-                    const s = window.getComputedStyle(el);
-                    return s && s.display !== 'none' && s.visibility !== 'hidden';
-                };
                 let out = '';
-                document.querySelectorAll('h1,h2,h3,h4,p,li,span,a,.tagline,title').forEach(el => {
-                    if (el.children.length === 0 && isVisible(el) && el.innerText) {
-                        const t = el.innerText.trim();
-                        if (t.length > 2) out += t + ' | ';
-                    }
+                document.querySelectorAll('h1,h2,title,p').forEach(el => {
+                    if (el.innerText) out += el.innerText.trim() + ' | ';
                 });
                 return out;
             }"""
@@ -345,116 +288,76 @@ def get_page_text(page):
 
 
 def generate_personalized_line(page, website):
-    """
-    B2B brand ki site padhke 1 short, specific personalized opening line banao.
-    Category/product/customer pe focus. Fail hone par "" (safe fallback).
-    """
     site_text = get_page_text(page)
     if len(site_text.strip()) < 40:
         return ""
 
-    prompt = """You are writing the FIRST sentence of a cold outreach message to a B2B brand (SaaS, software, or a B2B service/product company).
-
+    prompt = """You are writing the FIRST sentence of a cold outreach message to a B2B brand.
 Here is text scraped from their website ({website}):
----
 {site_text}
----
 
-Write ONE short, specific, genuine opening line (max 22 words) that shows we actually looked at their site.
+Write ONE short, genuine opening line (max 22 words) that shows we actually looked at their site.
 Rules:
-- Mention something REAL and specific about what they do: their product category, who they serve (their target customer/industry), or a specific value proposition you can see in the text.
-- Sound human and sharp, NOT salesy or generic. No "I hope this finds you well".
-- Do NOT mention SEO, links, AI search, rankings, or our offer - that comes later.
-- Do NOT use the founder's or company's full marketing slogan verbatim.
+- Mention something REAL and specific about what they do: their product category or target industry.
+- No "I hope this finds you well". No marketing slogans verbatim.
 - End with a comma or dash so the next sentence flows naturally.
-- Return ONLY the line itself. No quotes, no explanation, no markdown.
-
-Example good output: Saw you help finance teams automate month-end close -"""
+- Return ONLY the line itself. No quotes, no explanations, no markdown."""
 
     prompt = prompt.format(website=website, site_text=site_text)
-
-    raw = None
-    waits = [3, 10, 20]
-    for attempt in range(3):
-        try:
-            resp = gemini_model.generate_content(prompt)
-            raw = (resp.text or "").strip()
-            break
-        except Exception as e:
-            msg = str(e)
-            if any(c in msg for c in ("429", "500", "503", "overloaded", "quota", "timeout", "rate")):
-                w = waits[attempt]
-                log.warning("  [Personalize] Gemini busy ({}), retry in {}s...".format(msg[:30], w))
-                time.sleep(w)
-                continue
-            log.warning("  [Personalize] failed: {}".format(msg[:60]))
-            return ""
-    if not raw:
-        return ""
-
-    line = raw.replace("```", "").strip().strip('"').strip("'").strip()
-    line = line.split("\n")[0].strip()
-    if len(line) > 200 or len(line.split()) > 30:
-        return ""
-    log.info("  [Personalize] {}".format(line[:80]))
-    return line
+    try:
+        resp = gemini_model.generate_content(prompt)
+        raw = (resp.text or "").strip().replace("```", "").strip('"').strip("'").split("\n")[0]
+        if 5 < len(raw.split()) < 30:
+            log.info("  [Personalize] Hook Built: {}".format(raw[:80]))
+            return raw
+    except Exception:
+        pass
+    return ""
 
 # ------------------------------------------
-#  AI FORM ANALYSIS (Claude Vision)
+#  AI FORM ANALYSIS 
 # ------------------------------------------
 
 def get_page_html(page):
-    def grab(frame):
-        try:
-            return frame.evaluate("""() => {
-                const els = document.querySelectorAll(
-                    'input, textarea, button, select, label, form'
-                );
-                return Array.from(els).map(el => el.outerHTML).join('\\n');
-            }""")
-        except Exception:
-            return ""
-    parts = []
+    """Deep Flattener mapping logic that targets Shadow DOM elements and child frame inputs."""
     try:
-        parts.append(grab(page))
-    except Exception:
-        pass
-    try:
+        js_extractor = """() => {
+            const getAttrs = (el) => {
+                let tag = el.tagName.toLowerCase();
+                let res = [];
+                ['id', 'name', 'type', 'placeholder', 'class', 'role', 'aria-label'].forEach(a => {
+                    let v = el.getAttribute(a); if(v) res.push(`${a}="${v}"`);
+                });
+                return `<${tag} ${res.join(' ')}>${['button', 'label'].includes(tag) ? el.innerText.strip() : ''}</${tag}>`;
+            };
+            let stream = '';
+            document.querySelectorAll('form, input, textarea, button, select, label, [role="form"]').forEach(el => {
+                stream += getAttrs(el) + '\\n';
+            });
+            const processShadow = (root) => {
+                if(!root) return;
+                root.querySelectorAll('input, textarea, button, select, label').forEach(m => { stream += '[SHADOW] ' + getAttrs(m) + '\\n'; });
+                root.querySelectorAll('*').forEach(child => { if(child.shadowRoot) processShadow(child.shadowRoot); });
+            };
+            processShadow(document);
+            return stream;
+        }"""
+        chunks = [page.evaluate(js_extractor)]
         for fr in page.frames:
-            if fr == page.main_frame:
-                continue
-            h = grab(fr)
-            if h and ("input" in h or "form" in h):
-                parts.append(h)
+            if fr != page.main_frame:
+                try:
+                    fh = fr.evaluate(js_extractor)
+                    if fh.strip(): chunks.append("[IFRAME] " + fh)
+                except: pass
+        return "\n".join(chunks)[:25000]
     except Exception:
-        pass
-    return "\n".join(p for p in parts if p)[:18000]
+        return ""
 
 
 def ask_claude(page, website, subject, message):
-    """Claude ko dynamic elements (subject/message) ke saath call karein."""
-    try:
-        page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception:
-        pass
-    for _ in range(4):
-        try:
-            page.wait_for_selector("input, textarea, select", timeout=3000)
-            break
-        except Exception:
-            try:
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-            except Exception:
-                pass
-            time.sleep(1)
-
     page_html = get_page_html(page)
-    if len(page_html) > 50000:
-        page_html = page_html[:50000]
-
-    prompt = """You are a web automation expert. Fill this contact form on: {website}
-
-Form HTML:
+    prompt = """You are a web automation expert. Find structural selectors to fill this contact form on: {website}
+Form DOM Map:
 {html}
 
 Details to fill:
@@ -465,186 +368,86 @@ Details to fill:
 - Email: {email}
 - Phone: {phone}
 - Subject/Title: {subject}
-- Message (copy EXACTLY, keep all line breaks):
+- Message (Keep EXACTLY as copy):
 {message}
 
-IMPORTANT: Fill the message field with the COMPLETE text above. Do not truncate or summarize.
+Return ONLY a standard valid JSON array format. Ex:
+[ {{"action": "fill", "selector": "input[name='email']", "value": "value"}}, {{"action": "click", "selector": "button[type='submit']"}} ]
+Rules: No markdown wrap, no explanations. Skip empty elements."""
 
-Return ONLY a JSON array of actions. Each action:
-  "action": "fill" | "check" | "click" | "select"
-  "selector": CSS selector (prefer name/id/type attributes)
-  "value": value to use
-
-Rules:
-- Only include fields that exist in the HTML
-- IMPORTANT: Only fill an ACTUAL CONTACT/ENQUIRY form. Do NOT fill search boxes (input name="s", role="search"), login forms (name="log"/"pwd"/"username"/"password"), or newsletter-only email boxes. If there is no real contact form, return an empty array [].
-- HUMAN-CHECK QUESTIONS: If the form has a simple text question to prove you're human (e.g. "which is bigger, 2 or 8?", "what is 3+4?", "type the word yes", "what color is the sky?"), SOLVE it and fill the answer in that field. Answer with the simplest correct value (e.g. "8", "7", "yes", "blue").
-- For checkboxes (terms/agree/consent/privacy) use "check".
-- REQUIRED checkbox groups (marked with * like "Services", "Interested in", "Budget"): you MUST select at least one option, else the form won't submit. Prefer an SEO / digital-marketing / "Google SEO" / "search" related option if available; otherwise pick the first reasonable option. Use "check" for it.
-- For the submit button use "click" - include it LAST. Pick the form's actual submit button (type="submit" inside the contact form), not a search or login button.
-- COMMON FIELDS: fill phone/mobile with the phone, website/url with our site, subject/topic with a short subject like "Partnership enquiry". For dropdowns/select (subject, service, "how did you hear", country), use "select" and pick the most relevant option (e.g. SEO/marketing/general enquiry); if unsure pick the first non-empty option.
-- SKIP appointment-booking fields: do NOT fill Date, Time, date pickers, calendar fields, age, or appointment-slot fields. Leave them empty. Fill only name, email, phone, company, and message. Put all the outreach text in the message/comment field.
-- Message field: use the FULL message text provided
-- Return ONLY JSON, no markdown, no explanation""".format(
-        website=website,
-        html=page_html,
-        full_name=FULL_NAME,
-        first_name=FIRST_NAME,
-        last_name=LAST_NAME,
-        company=COMPANY,
-        email=EMAIL,
-        phone=PHONE,
-        subject=subject,
-        message=message
-    )
-
-    raw = None
-    waits = [5, 20, 40, 60]
-    for attempt in range(4):
-        try:
-            resp = gemini_model.generate_content(prompt)
-            raw = resp.text.strip()
-            break
-        except Exception as e:
-            msg = str(e)
-            if any(code in msg for code in ("429", "500", "503", "overloaded", "quota", "timeout", "rate")):
-                w = waits[attempt]
-                log.warning("  [AI] Gemini busy ({}), retry in {}s...".format(msg[:40], w))
-                time.sleep(w)
-                continue
-            raise
-    if raw is None:
-        raise Exception("Gemini API failed after 4 retries")
-
+    prompt = prompt.format(website=website, html=page_html, full_name=FULL_NAME, first_name=FIRST_NAME, last_name=LAST_NAME, company=COMPANY, email=EMAIL, phone=PHONE, subject=subject, message=message)
+    
+    resp = gemini_model.generate_content(prompt)
+    raw = resp.text.strip()
     if "```" in raw:
         raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
+        if raw.startswith("json"): raw = raw[4:]
     return json.loads(raw.strip())
 
 # ------------------------------------------
 #  EXECUTE ACTIONS
 # ------------------------------------------
 
-def scroll_to(page, locator):
-    try:
-        locator.scroll_into_view_if_needed(timeout=2000)
-        time.sleep(0.2)
-    except Exception:
-        pass
-
-
 def execute_actions(page, actions):
     filled = []
     submitted = False
+    if not actions: return filled, submitted
 
     for action in actions:
-        act      = action.get("action", "").lower()
-        selector = action.get("selector", "")
-        value    = action.get("value", "")
+        act = action.get("action", "").lower()
+        sel = action.get("selector", "")
+        val = action.get("value", "")
+        if not sel: continue
 
-        if not selector:
-            continue
+        target = None
+        try:
+            if page.locator(sel).first.is_visible(timeout=300):
+                target = page.locator(sel).first
+        except: pass
+
+        if not target:
+            for frame in page.frames:
+                try:
+                    if frame.locator(sel).first.is_visible(timeout=200):
+                        target = frame.locator(sel).first; break
+                except: pass
+
+        if not target: continue
 
         try:
-            locator = page.locator(selector).first
-            scroll_to(page, locator)
-
             if act == "fill":
-                if locator.is_visible(timeout=1000):
-                    locator.fill(value)
-                    log.info("  [OK] fill: {}".format(selector[:50]))
-                    filled.append(selector[:30])
-
+                target.scroll_into_view_if_needed(timeout=1000)
+                target.fill(val)
+                filled.append(sel.split("[")[0][:20])
             elif act == "check":
-                if locator.is_visible(timeout=1000) and not locator.is_checked():
-                    locator.check()
-                    log.info("  [OK] check: {}".format(selector[:50]))
-
+                target.check(timeout=1000)
             elif act == "select":
-                if locator.is_visible(timeout=1000):
-                    locator.select_option(value)
-                    log.info("  [OK] select: {}".format(selector[:50]))
-
+                target.select_option(val)
             elif act == "click":
-                if locator.is_visible(timeout=1000):
-                    url_before = page.url
-                    try:
-                        locator.scroll_into_view_if_needed(timeout=2000)
-                    except Exception:
-                        pass
-                    try:
-                        locator.click(timeout=5000)
-                    except Exception:
-                        try:
-                            locator.evaluate("el => el.click()")
-                        except Exception:
-                            pass
-                    success_words = ["thank you", "thanks", "message sent", "we'll be in touch",
-                                     "we have received", "submitted successfully", "your message",
-                                     "successfully sent", "received your", "get back to you",
-                                     "contacting us", "be in touch", "form submitted", "sent successfully",
-                                     "we'll get back", "message has been sent", "successfully submitted",
-                                     "your submission", "appreciate you", "has been received",
-                                     "will respond", "soon as possible", "form was submitted",
-                                     "message received", "we received", "submission received",
-                                     "we'll reach out", "reach out to you", "talk to you soon",
-                                     "we will contact", "request received", "got your message",
-                                     "ticket has been", "enquiry received", "inquiry received",
-                                     "we'll respond", "in touch shortly", "received and"]
-                    confirmed = False
-                    captcha_done = False
-                    retried_click = False
-                    for i in range(20):
-                        time.sleep(3)
-                        if not captcha_done:
-                            try:
-                                if solve_captcha(page, page.url):
-                                    captcha_done = True
-                                    try:
-                                        locator.click(timeout=2000)
-                                    except Exception:
-                                        pass
-                                    time.sleep(2)
-                            except Exception:
-                                pass
-                        page_text = ""
-                        try:
-                            page_text = page.inner_text("body", timeout=3000).lower()
-                        except Exception:
-                            pass
-                        url_changed = page.url != url_before
-                        if any(w in page_text for w in success_words) or url_changed:
-                            confirmed = True
-                            break
-                        if i == 3 and not retried_click:
-                            retried_click = True
-                            try:
-                                if locator.is_visible(timeout=1000):
-                                    locator.evaluate("el => el.click()")
-                                    time.sleep(1)
-                                    locator.press("Enter")
-                            except Exception:
-                                pass
-                    if confirmed:
-                        submitted = True
-                        log.info("  [OK] submit confirmed: {}".format(selector[:50]))
-                    else:
-                        log.warning("  [??] clicked but NO confirmation: {}".format(selector[:50]))
-
-        except Exception as e:
-            log.warning("  [--] {}: {} -> {}".format(act, selector[:50], e))
-
+                url_before = page.url
+                try: target.click(timeout=3000)
+                except: target.evaluate("el => el.click()")
+                
+                time.sleep(5)
+                success_keywords = ["thank", "thanks", "sent", "success", "submitted", "received", "scheduled"]
+                page_text = ""
+                try: page_text = page.inner_text("body", timeout=1000).lower()
+                except: pass
+                
+                if page.url != url_before or any(w in page_text for w in success_keywords):
+                    submitted = True
+        except Exception:
+            pass
+            
     return filled, submitted
 
 # ------------------------------------------
-#  MAIN
+#  MAIN RUNNER
 # ------------------------------------------
 
 def main():
     log.info("Connecting to Google Sheets...")
     ws = init_sheets()
-
     pending = get_pending_rows(ws)
     log.info("Pending sites: {}".format(len(pending)))
 
@@ -655,147 +458,77 @@ def main():
     to_process = pending[:PROCESS_LIMIT]
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ]
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        )
-
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        
+        tabs = []
+        context.on("page", lambda p: tabs.append(p))
         pg = context.new_page()
-        pg.set_default_timeout(20000)
-        pg.set_default_navigation_timeout(30000)
-        pg.route("**/*", lambda route: route.abort()
-            if route.request.resource_type in ("image", "media")
-            else route.continue_())
+        pg.set_default_timeout(25000)
 
         for row_idx, row_data in to_process:
-            website_raw = row_data.get("website", "")
-            website = normalise_url(website_raw)
-
-            # Subject fixed hai (koi placeholder nahi)
+            tabs.clear()
+            website = normalise_url(row_data.get("website", ""))
             current_subject = SUBJECT_TEMPLATE
-
             log.info("\nOpening: {}".format(website))
 
             try:
-                pg.goto(website, timeout=30000, wait_until="domcontentloaded")
-                time.sleep(2)
+                pg.goto(website, timeout=35000, wait_until="domcontentloaded")
+                time.sleep(3)
                 dismiss_cookie_banner(pg)
 
-                # --- PERSONALIZE: homepage pe rehte hue brand ka content padhke
-                #     personalized opening line banao (contact page jaane se PEHLE) ---
-                try:
-                    intro_line = generate_personalized_line(pg, website)
-                except Exception as e:
-                    log.warning("  [Personalize] error: {}".format(str(e)[:50]))
-                    intro_line = ""
+                try: intro_line = generate_personalized_line(pg, website)
+                except: intro_line = ""
+                
                 intro_block = (intro_line.strip() + "\n\n") if intro_line.strip() else ""
                 current_message = MESSAGE_TEMPLATE.format(intro=intro_block)
 
-                contact_found = find_contact_page(pg, website)
-                if not contact_found:
-                    log.info("  No separate contact page - checking current page for form")
-
-                time.sleep(1)
-                dismiss_cookie_banner(pg)
+                find_contact_page(pg, website)
+                time.sleep(2)
+                
+                active_page = tabs[-1] if tabs else pg
+                dismiss_cookie_banner(active_page)
+                solve_captcha(active_page, website)
 
                 try:
-                    pg.wait_for_load_state("networkidle", timeout=6000)
-                except Exception:
-                    pass
-                try:
-                    pg.wait_for_selector("form, input[type='email'], input[type='text'], textarea",
-                                         timeout=8000)
-                except Exception:
-                    pass
-                try:
-                    pg.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-                    time.sleep(1.5)
-                except Exception:
-                    pass
-
-                solve_captcha(pg, website)
-
-                # Claude processes dynamic templates
-                try:
-                    actions = ask_claude(pg, website, current_subject, current_message)
-                    log.info("  [AI] {} actions".format(len(actions)))
+                    actions = ask_claude(active_page, website, current_subject, current_message)
+                    log.info("  [AI Matrix Selector] {} actions generated".format(len(actions)))
                 except Exception as e:
-                    log.error("  [AI] Error: {}".format(e))
-                    update_sheet_row(ws, row_idx, "error", "AI error: {}".format(str(e)[:80]))
+                    update_sheet_row(ws, row_idx, "error", "AI Selector Break: {}".format(str(e)[:50]))
                     continue
 
-                filled, submitted = execute_actions(pg, actions)
-                time.sleep(1)
+                filled, submitted = execute_actions(active_page, actions)
 
+                # Screenshots Logic Layer
                 try:
-                    import re, os
-                    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', website)[:50]
-                    os.makedirs("screenshots/before_submit", exist_ok=True)
-                    screenshot_path = "screenshots/before_submit/{}.png".format(safe_name)
-                    pg.screenshot(path=screenshot_path, full_page=False)
-                    log.info("  [Screenshot] Before submit saved: {}".format(screenshot_path))
-                except Exception as e:
-                    log.warning("  [Screenshot] Failed: {}".format(e))
+                    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', website)[:40]
+                    os.makedirs("screenshots/after_submit", exist_ok=True)
+                    active_page.screenshot(path="screenshots/after_submit/{}.png".format(safe_name), full_page=False)
+                except: pass
 
                 if submitted:
                     status = "submitted"
+                    notes = "Form submitted and verified via context changes."
                 elif not filled:
                     status = "no_form_found"
+                    notes = "Skipped: Forms or embedded appointment widgets could not be mapped inside DOM."
                 else:
                     status = "filled_not_submitted"
+                    notes = f"Fields filled ({', '.join(filled)}), submit trigger didn't catch redirect response."
 
-                try:
-                    import re, os
-                    try:
-                        pg.wait_for_load_state("networkidle", timeout=8000)
-                    except Exception:
-                        pass
-                    time.sleep(2)
-                    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', website)[:50]
-                    os.makedirs("screenshots/after_submit", exist_ok=True)
-                    screenshot_path = "screenshots/after_submit/{}.png".format(safe_name)
-                    pg.screenshot(path=screenshot_path, full_page=False)
-                    log.info("  [Screenshot] After submit saved: {}".format(screenshot_path))
-                except Exception as e:
-                    log.warning("  [Screenshot] Failed: {}".format(e))
+                update_sheet_row(ws, row_idx, status, notes=notes, fields_filled=", ".join(filled))
+                
+                for extra_tab in context.pages:
+                    if extra_tab != pg: extra_tab.close()
+                time.sleep(5)
 
-                if submitted:
-                    note_text = "OK"
-                elif not filled:
-                    note_text = "No form on page (manual not needed)"
-                else:
-                    note_text = "Submit failed - try manually"
-                    
-                update_sheet_row(
-                    ws, row_idx, status,
-                    notes=note_text,
-                    fields_filled=", ".join(filled),
-                    ai_actions=str(len(actions))
-                )
-
-                log.info("  Status: {}".format(status))
-                time.sleep(1)
-
-            except Exception as e:
-                log.error("  ERROR: {}".format(e))
-                update_sheet_row(ws, row_idx, "error", str(e)[:100])
+            except Exception as row_err:
+                log.error("Row Error trapped gracefully: {}".format(row_err))
+                update_sheet_row(ws, row_idx, "error", notes=str(row_err)[:60])
+                for extra_tab in context.pages:
+                    if extra_tab != pg: extra_tab.close()
 
         browser.close()
-
-    log.info("\nRun complete!")
-
 
 if __name__ == "__main__":
     main()

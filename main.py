@@ -2,9 +2,10 @@
 """
 AI-Powered Contact Form Bot (Dynamic Engine Update)
 - Engine Wrapper: Multi-Tier Fail-Safe Sheet Handler
-- Fixed: Sheets mismatch sync drops & structural header updates.
-- Patched: Hard per-site wall-clock timeout (signal.alarm) + Gemini request timeouts
-  + wedged-page recovery, so a single bad site can no longer hang the whole run.
+- Patched: Each site runs in an isolated CHILD PROCESS with a hard kill timeout.
+  signal.alarm could not interrupt Playwright/gRPC blocked-socket hangs (the
+  handler never runs while the main thread is stuck in C). A child process can
+  always be killed by the OS, so a single bad site can no longer freeze the run.
 """
 import os
 import json
@@ -13,8 +14,8 @@ import time
 import logging
 import sys
 import re
-import signal
 import warnings
+import multiprocessing as mp
 from datetime import datetime
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -33,14 +34,13 @@ CAPTCHA_API_KEY     = os.environ["CAPTCHA_API_KEY"]
 GOOGLE_SHEET_ID     = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDS_JSON   = os.environ["GOOGLE_CREDS_JSON"]
 
-# Gemini Setup
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-3.1-flash-lite")
+GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
 
-# Hard ceiling (seconds) for total time spent on ONE website. After this the
-# row is abandoned and marked error, no matter where it is stuck.
+# Hard ceiling (seconds) for the ENTIRE processing of one website, enforced by
+# killing the child process. This is the real protection against frozen sites.
 PER_SITE_TIMEOUT = 150
-# Timeouts for the two Gemini API calls so they can never silently block forever.
+# Inner timeouts on the two Gemini calls. Belt-and-suspenders; the process kill
+# is what actually guarantees progress.
 GEMINI_HOOK_TIMEOUT = 30
 GEMINI_FORM_TIMEOUT = 40
 
@@ -79,24 +79,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ------------------------------------------
-#  HARD TIMEOUT GUARD (per-site wall clock)
-# ------------------------------------------
-
-class RowTimeout(Exception):
-    """Raised by the SIGALRM handler when a single site exceeds PER_SITE_TIMEOUT."""
-    pass
-
-
-def _alarm_handler(signum, frame):
-    raise RowTimeout("Per-site wall-clock timeout exceeded")
-
-
-# Register once at import time. SIGALRM is only available on Unix (GitHub
-# Actions Ubuntu runners are Unix, so this is fine).
-signal.signal(signal.SIGALRM, _alarm_handler)
-
-# ------------------------------------------
-#  GOOGLE SHEETS ENGINE (UPGRADED)
+#  GOOGLE SHEETS ENGINE (parent process only)
 # ------------------------------------------
 
 def init_sheets():
@@ -109,12 +92,10 @@ def init_sheets():
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
 
-    # Tab mapping lookup logic
     ws = None
     try:
         ws = sh.worksheet("websites")
     except gspread.WorksheetNotFound:
-        # Fallback layer: Case insensitive scanning
         for sheet in sh.worksheets():
             if sheet.title.lower().strip() == "websites":
                 ws = sheet
@@ -124,7 +105,6 @@ def init_sheets():
             ws = sh.add_worksheet("websites", rows=1000, cols=7)
             ws.update("A1:G1", [["website", "city", "status", "submitted_at", "notes", "fields_filled", "ai_actions"]])
 
-    # Structure integrity validation
     headers = [str(h).strip().lower() for h in ws.row_values(1)]
     if not headers or "website" not in headers:
         log.warning("Sheet Headers out of sync. Injecting structural automation grid row...")
@@ -147,7 +127,6 @@ def update_sheet_row(ws, row_num, status, notes="", fields_filled="", ai_actions
         ws.update("{}{}:{}{}".format(start_col, excel_row, end_col, excel_row),
                   [[status, now, notes, fields_filled, ai_actions]])
     except Exception:
-        # Static Matrix Fallback mapping structure
         ws.update("C{}:G{}".format(excel_row, excel_row),
                   [[status, now, notes, fields_filled, ai_actions]])
 
@@ -158,21 +137,16 @@ def get_pending_rows(ws):
     """Parses structural maps mapping non-blank rows while preserving casing variants."""
     rows = ws.get_all_records()
     pending = []
-
     for i, row in enumerate(rows):
-        # Normalization layer for row dictionary casing differences
         normalized_row = {str(k).strip().lower(): v for k, v in row.items()}
-
         url = str(normalized_row.get("website", "")).strip()
         status = str(normalized_row.get("status", "")).strip().lower()
-
         if url and status not in ("submitted", "processing", "no_form_found"):
             pending.append((i + 1, normalized_row))
-
     return pending
 
 # ------------------------------------------
-#  BROWSER AUTOMATION WRAPPERS
+#  BROWSER AUTOMATION WRAPPERS (run in child)
 # ------------------------------------------
 
 def normalise_url(url):
@@ -240,7 +214,7 @@ def find_contact_page(page, base_url):
     return False
 
 # ------------------------------------------
-#  CAPTCHA & AI CONTEXT LOGIC
+#  CAPTCHA & AI CONTEXT LOGIC (run in child)
 # ------------------------------------------
 
 def solve_captcha(page, website):
@@ -263,7 +237,7 @@ def solve_captcha(page, website):
     return False
 
 
-def generate_personalized_line(page, website):
+def generate_personalized_line(gemini_model, page, website):
     try:
         txt = page.evaluate("() => { let out = ''; document.querySelectorAll('h1,h2,title,p').forEach(el => { out += el.innerText + ' | ' }); return out; }")[:3000]
         if len(txt.strip()) < 40: return ""
@@ -297,7 +271,7 @@ def get_page_html(page):
     except: return ""
 
 
-def ask_gemini_for_form(page, website, subject, message):
+def ask_gemini_for_form(gemini_model, page, website, subject, message):
     """Sends the form DOM map to Gemini and returns a list of fill/click actions."""
     html = get_page_html(page)
     prompt = """You are a functional web parser script executor. Return ONLY a standard structured JSON array list mapping actions for this DOM:
@@ -368,7 +342,87 @@ def execute_actions(page, actions):
     return filled, submitted
 
 # ------------------------------------------
-#  MAIN RUNNER SYSTEM ENGINE
+#  CHILD-PROCESS WORKER  (one site, fully isolated)
+# ------------------------------------------
+
+def process_single_site(website_raw, result_q):
+    """
+    Runs in a separate process. Does ALL the slow/hang-prone work for one site:
+    its own Playwright instance, its own Gemini client. Puts a result dict on
+    result_q. If this process hangs, the parent kills it after PER_SITE_TIMEOUT.
+    """
+    result = {"status": "error", "notes": "Worker exited before completion", "fields_filled": ""}
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+
+        website = normalise_url(website_raw)
+        current_subject = SUBJECT_TEMPLATE
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            tabs = []
+            context.on("page", lambda pg_: tabs.append(pg_))
+            pg = context.new_page()
+            pg.set_default_timeout(25000)
+
+            pg.goto(website, timeout=35000, wait_until="domcontentloaded")
+            time.sleep(3)
+            dismiss_cookie_banner(pg)
+
+            try:
+                intro_line = generate_personalized_line(gemini_model, pg, website)
+            except:
+                intro_line = ""
+
+            intro_block = (intro_line.strip() + "\n\n") if intro_line.strip() else ""
+            current_message = MESSAGE_TEMPLATE.format(intro=intro_block)
+
+            find_contact_page(pg, website)
+            time.sleep(2)
+
+            active_page = tabs[-1] if tabs else pg
+            dismiss_cookie_banner(active_page)
+            solve_captcha(active_page, website)
+
+            try:
+                actions = ask_gemini_for_form(gemini_model, active_page, website, current_subject, current_message)
+            except Exception as e:
+                result = {"status": "error",
+                          "notes": "Form Engine Structure Read Error: {}".format(str(e)[:45]),
+                          "fields_filled": ""}
+                browser.close()
+                result_q.put(result)
+                return
+
+            filled, submitted = execute_actions(active_page, actions)
+
+            if submitted:
+                status, notes = "submitted", "Pipeline verified submission context."
+            elif not filled:
+                status, notes = "no_form_found", "Skipped: Structural layout forms not mapped."
+            else:
+                status, notes = "filled_not_submitted", "Trigger dropped redirect checks ({}).".format(", ".join(filled))
+
+            result = {"status": status, "notes": notes, "fields_filled": ", ".join(filled)}
+            browser.close()
+
+    except Exception as worker_err:
+        result = {"status": "error", "notes": str(worker_err)[:60], "fields_filled": ""}
+
+    try:
+        result_q.put(result)
+    except:
+        pass
+
+# ------------------------------------------
+#  MAIN RUNNER (parent: orchestration + Sheets only)
 # ------------------------------------------
 
 def main():
@@ -382,95 +436,44 @@ def main():
         return
 
     to_process = pending[:PROCESS_LIMIT]
+    ctx = mp.get_context("spawn")  # clean, no inherited Playwright/gRPC state
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    for row_idx, row_data in to_process:
+        website_raw = row_data.get("website", row_data.get("url", ""))
+        website = normalise_url(website_raw)
+        log.info("\nLaunching Processing Vector: {}".format(website))
 
-        tabs = []
-        context.on("page", lambda p: tabs.append(p))
-        pg = context.new_page()
-        pg.set_default_timeout(25000)
+        result_q = ctx.Queue()
+        worker = ctx.Process(target=process_single_site, args=(website_raw, result_q))
+        worker.start()
+        worker.join(PER_SITE_TIMEOUT)
 
-        for row_idx, row_data in to_process:
-            tabs.clear()
-            # Grabs domain using prioritized key variations match fallback
-            website_raw = row_data.get("website", row_data.get("url", ""))
-            website = normalise_url(website_raw)
-            current_subject = SUBJECT_TEMPLATE
+        if worker.is_alive():
+            # Site is wedged in a blocked socket call. Kill it outright.
+            log.error("Hard per-site timeout ({}s) hit, killing worker: {}".format(PER_SITE_TIMEOUT, website))
+            worker.terminate()
+            worker.join(10)
+            if worker.is_alive():
+                worker.kill()  # SIGKILL if terminate wasn't enough
+                worker.join(5)
+            update_sheet_row(ws, row_idx, "error",
+                             notes="Hard per-site timeout ({}s) - worker killed".format(PER_SITE_TIMEOUT))
+            continue
 
-            log.info("\nLaunching Processing Vector: {}".format(website))
+        # Worker finished on its own; collect its result if present.
+        try:
+            result = result_q.get_nowait()
+        except Exception:
+            result = {"status": "error",
+                      "notes": "Worker ended without result (exit {})".format(worker.exitcode),
+                      "fields_filled": ""}
 
-            # Arm the hard wall-clock guard for this single site.
-            signal.alarm(PER_SITE_TIMEOUT)
+        update_sheet_row(ws, row_idx, result["status"],
+                         notes=result.get("notes", ""),
+                         fields_filled=result.get("fields_filled", ""))
+        log.info("  [AI Grid Engine Map] Row complete -> {}".format(result["status"]))
+        time.sleep(2)
 
-            try:
-                pg.goto(website, timeout=35000, wait_until="domcontentloaded")
-                time.sleep(3)
-                dismiss_cookie_banner(pg)
-
-                try: intro_line = generate_personalized_line(pg, website)
-                except: intro_line = ""
-
-                intro_block = (intro_line.strip() + "\n\n") if intro_line.strip() else ""
-                current_message = MESSAGE_TEMPLATE.format(intro=intro_block)
-
-                find_contact_page(pg, website)
-                time.sleep(2)
-
-                active_page = tabs[-1] if tabs else pg
-                dismiss_cookie_banner(active_page)
-                solve_captcha(active_page, website)
-
-                try:
-                    actions = ask_gemini_for_form(active_page, website, current_subject, current_message)
-                    log.info("  [AI Grid Engine Map] Successfully parsed form targets.")
-                except Exception as e:
-                    update_sheet_row(ws, row_idx, "error", "Form Engine Structure Read Error: {}".format(str(e)[:45]))
-                    continue
-
-                filled, submitted = execute_actions(active_page, actions)
-
-                if submitted:
-                    status, notes = "submitted", "Pipeline verified submission context."
-                elif not filled:
-                    status, notes = "no_form_found", "Skipped: Structural layout forms not mapped."
-                else:
-                    status, notes = "filled_not_submitted", f"Trigger dropped redirect checks ({', '.join(filled)})."
-
-                update_sheet_row(ws, row_idx, status, notes=notes, fields_filled=", ".join(filled))
-
-                for extra_tab in context.pages:
-                    if extra_tab != pg: extra_tab.close()
-                time.sleep(4)
-
-            except RowTimeout:
-                # Hard ceiling hit. Abandon this site and rebuild the page,
-                # because a wedged page would carry the hang into the next row.
-                log.error("Hard per-site timeout ({}s) hit, skipping: {}".format(PER_SITE_TIMEOUT, website))
-                update_sheet_row(ws, row_idx, "error", notes="Hard per-site timeout ({}s)".format(PER_SITE_TIMEOUT))
-                try:
-                    for extra_tab in context.pages:
-                        if extra_tab != pg: extra_tab.close()
-                except: pass
-                try:
-                    pg.close()
-                except: pass
-                pg = context.new_page()
-                pg.set_default_timeout(25000)
-
-            except Exception as row_err:
-                log.error("Graceful Trap catching processing error: {}".format(row_err))
-                update_sheet_row(ws, row_idx, "error", notes=str(row_err)[:60])
-                for extra_tab in context.pages:
-                    if extra_tab != pg: extra_tab.close()
-
-            finally:
-                # Always disarm the alarm so it can never fire during the next
-                # row's setup or during the Sheets write above.
-                signal.alarm(0)
-
-        browser.close()
     log.info("=== Bot Workspace Execution Pipeline Complete ===")
 
 if __name__ == "__main__":
